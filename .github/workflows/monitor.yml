@@ -1,26 +1,40 @@
 name: Monitor
 
+# En vez de depender del cron de GitHub (que descarta corridas seguido),
+# cada corrida queda viva ~5h30 chequeando cada 2 minutos y, al terminar,
+# lanza la siguiente. El cron horario es solo un respaldo por si la cadena se corta.
 on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/monitor.yml"
+      - "monitor-canchas.ps1"
   schedule:
-    - cron: "*/5 * * * *"   # cada 5 min (GitHub puede demorarlo algunos minutos)
-  workflow_dispatch: {}      # permite correrlo a mano desde la pestana Actions
+    - cron: "17 * * * *"
 
 permissions:
-  contents: write            # para guardar estado.json entre corridas
+  contents: write   # guardar estado.json
+  actions: write    # lanzar la siguiente corrida
 
+# Una sola corrida a la vez; si llega otra queda en espera (y reemplaza a cualquier otra en espera)
 concurrency:
   group: monitor
   cancel-in-progress: false
 
+env:
+  INTERVALO_SEG: "120"      # cada cuanto chequea
+  DURACION_SEG: "19800"     # cuanto vive cada corrida (5h30; el limite de GitHub es 6h)
+
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
-      - name: Consultar disponibilidad
-        shell: pwsh
+      - name: Chequear en bucle
+        shell: bash
         env:
           CLUB_ID: ${{ secrets.CLUB_ID }}
           SPORT_ID: ${{ secrets.SPORT_ID }}
@@ -31,15 +45,23 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          ./monitor-canchas.ps1
-          Get-Content ./monitor.log -ErrorAction SilentlyContinue
+          git config user.name "monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          fin=$((SECONDS + DURACION_SEG))
+          while [ $SECONDS -lt $fin ]; do
+            pwsh -NoProfile -File ./monitor-canchas.ps1 || echo "error en el chequeo (sigo)"
+            tail -n 1 monitor.log 2>/dev/null || true
+            if ! git diff --quiet -- estado.json || [ -n "$(git ls-files --others -- estado.json)" ]; then
+              git add estado.json
+              git commit -q -m "estado: actualizar"
+              git pull -q --rebase || git rebase --abort || true
+              git push -q || echo "no pude guardar el estado (sigo)"
+            fi
+            sleep "$INTERVALO_SEG"
+          done
 
-      - name: Guardar estado si cambio
-        run: |
-          if ! git diff --quiet -- estado.json || [ -n "$(git ls-files --others -- estado.json)" ]; then
-            git config user.name "monitor-bot"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add estado.json
-            git commit -m "estado: actualizar"
-            git push
-          fi
+      - name: Lanzar la siguiente corrida
+        if: ${{ !cancelled() }}   # si cancelas la corrida a mano, la cadena se detiene
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref main --repo "${{ github.repository }}"
